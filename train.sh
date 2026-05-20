@@ -1,0 +1,22 @@
+# torchrun --standalone --nproc_per_node=8 train.py config/small_model.py config/train_owt.py config/with_mstbp_mhc.py
+# torchrun --standalone --nproc_per_node=8 train.py config/small_model.py config/train_owt.py config/with_astbp_mhc.py
+# torchrun --standalone --nproc_per_node=8 train.py config/small_model.py config/train_owt.py config/with_amstbp_mhc.py
+# torchrun --standalone --nproc_per_node=8 train.py config/small_model.py config/train_owt.py config/with_atbp_mhc.py
+# torchrun --standalone --nproc_per_node=8 train.py config/small_model.py config/train_owt.py config/with_stbp_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/small_model.py config/train_owt.py config/with_lmamstbp_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/small_model.py config/train_owt.py config/with_ltbp_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/small_model.py config/train_owt.py config/with_altbp_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/small_model.py config/train_owt.py config/with_lmaltbp_mhc.py
+# medium
+torchrun --standalone --nproc_per_node=8 train.py config/medium_model.py config/train_owt.py config/with_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/medium_model.py config/train_owt.py config/with_mhc_lite.py
+torchrun --standalone --nproc_per_node=8 train.py config/medium_model.py config/train_owt.py config/with_KromHC.py
+torchrun --standalone --nproc_per_node=8 train.py config/medium_model.py config/train_owt.py config/with_mstbp_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/medium_model.py config/train_owt.py config/with_astbp_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/medium_model.py config/train_owt.py config/with_amstbp_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/medium_model.py config/train_owt.py config/with_atbp_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/medium_model.py config/train_owt.py config/with_stbp_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/medium_model.py config/train_owt.py config/with_lmamstbp_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/medium_model.py config/train_owt.py config/with_ltbp_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/medium_model.py config/train_owt.py config/with_altbp_mhc.py
+torchrun --standalone --nproc_per_node=8 train.py config/medium_model.py config/train_owt.py config/with_lmaltbp_mhc.py
