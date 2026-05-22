@@ -1,6 +1,6 @@
 # TBP-mHC
 
-This repository contains the experiment code for the **TBP-mHC** paper [**TBP-mHC: full expressivity for manifold-constrained hyper connections through transportation polytopes**]().
+This repository contains the experiment code for the **TBP-mHC** paper [**TBP-mHC: full expressivity for manifold-constrained hyper connections through transportation polytopes**](https://arxiv.org/abs/2605.21724).
 It extends the previous [mHC-lite](https://github.com/FFTYYY/mhc-lite), [KromHC](https://github.com/wz1119/KromHC) and related mHC code repositories with TBP/RTBP parametrizations and experiments.
 
 ---
