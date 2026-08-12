@@ -8,6 +8,7 @@ This module provides tests to verify:
 4. Double stochasticity properties (where applicable)
 5. Parameter counting and shapes
 6. ORTBP2N optimizer grouping and log_stats (Phases 5–6)
+7. DORTBP2N depth labelling, gain invariants, and ORTBP2N parity at p=1
 
 Run tests:
     python -m hyper_conn.tests
@@ -17,6 +18,7 @@ Or import and run specific tests:
     run_all_tests()
 """
 
+import math
 import os
 import sys
 import torch
@@ -184,11 +186,326 @@ def test_ortbp_log_stats_smoke():
     return True
 
 
+def _perturb_chart_params(layer, seed=7):
+    """
+    Give a layer non-trivial transport-chart logits.
+
+    Both ORTBP2N and DORTBP2N initialize `static_alpha_res` and
+    `dynamic_res_alpha_fn` to zeros, so the chart logits are identically zero at
+    init and every depth gain produces the same matrix. Comparisons between gains
+    are only meaningful once the chart is off the midpoint.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        layer.static_alpha_res.copy_(
+            torch.randn(layer.static_alpha_res.shape, generator=gen)
+        )
+        layer.dynamic_res_alpha_fn.copy_(
+            torch.randn(layer.dynamic_res_alpha_fn.shape, generator=gen) * 0.1
+        )
+    return layer
+
+
+def test_dortbp_depth_labels():
+    """DORTBP2N depth labelling matches the chart parameter budget and gain invariants."""
+    from hyper_conn.dortbp2n_mhc import build_chart_gain, chart_depth_labels
+
+    print("\nTesting DORTBP2N depth labels and gains...")
+
+    expected_histograms = {
+        2: {0: 1},
+        4: {0: 1, 1: 8},
+        8: {0: 1, 1: 8, 2: 40},
+        16: {0: 1, 1: 8, 2: 40, 3: 176},
+    }
+
+    for n, expected in expected_histograms.items():
+        labels = chart_depth_labels(n)
+        assert len(labels) == (n - 1) ** 2, (
+            f"n={n}: labelled {len(labels)} coordinates, chart consumes {(n - 1) ** 2}"
+        )
+        histogram = {d: labels.count(d) for d in sorted(set(labels))}
+        assert histogram == expected, f"n={n}: histogram {histogram} != {expected}"
+        assert max(labels) == int(math.log2(n)) - 1 if n > 1 else True
+
+        # p = 1 must be exactly neutral, otherwise parity with ORTBP2N is lost.
+        neutral = build_chart_gain(n, depth_gain_base=1.0)
+        assert torch.all(neutral == 1.0), f"n={n}: p=1 gain is not all ones"
+
+        gain = build_chart_gain(n, depth_gain_base=1.1)
+        assert gain.shape == (n - 1, n - 1)
+        assert torch.allclose(gain.mean(), torch.tensor(1.0), atol=1e-6), (
+            f"n={n}: mean-normalized gain has mean {gain.mean().item()}"
+        )
+        if n > 2:
+            # Deeper coordinates get the larger gain for p > 1.
+            flat_gain = gain.flatten()
+            deepest = [g for g, d in zip(flat_gain, labels) if d == max(labels)]
+            root = flat_gain[0]
+            assert min(deepest) > root, f"n={n}: deepest gain not above root gain"
+
+        print(f"  n={n}: {len(labels)} coordinates, histogram {histogram}: OK")
+
+    # Explicit per-depth gains override the geometric law.
+    explicit = build_chart_gain(4, depth_gains=[0.5, 1.5], normalize=False)
+    labels = chart_depth_labels(4)
+    assert explicit.flatten()[0] == 0.5
+    assert all(explicit.flatten()[k] == 1.5 for k, d in enumerate(labels) if d == 1)
+    print("  explicit depth_gains override: OK")
+
+    for bad in (0.0, -1.0):
+        try:
+            build_chart_gain(4, depth_gain_base=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"depth_gain_base={bad} should raise")
+    try:
+        build_chart_gain(4, depth_gains=[1.0])  # needs 2 levels
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("short depth_gains should raise")
+    print("  invalid gain arguments rejected: OK")
+
+    print("  DORTBP2N depth labels: PASS")
+    return True
+
+
+def test_dortbp_parity_with_ortbp():
+    """DORTBP2N with depth_gain_base=1.0 reproduces ORTBP2N bitwise, forward and backward."""
+    from hyper_conn.dortbp2n_mhc import DORTBP2N_MHC
+    from hyper_conn.ortbp2n_mhc import ORTBP2N_MHC
+
+    print("\nTesting DORTBP2N parity with ORTBP2N at p=1...")
+
+    torch.manual_seed(0)
+    x = torch.randn(8, 6, 32)
+
+    baseline = _perturb_chart_params(ORTBP2N_MHC(4, dim=32, layer_index=0))
+    neutral = _perturb_chart_params(
+        DORTBP2N_MHC(4, dim=32, layer_index=0, depth_gain_base=1.0)
+    )
+    weighted = _perturb_chart_params(
+        DORTBP2N_MHC(4, dim=32, layer_index=0, depth_gain_base=1.3)
+    )
+
+    def forward(layer):
+        branch_input, add_residual = layer(x)
+        return add_residual(torch.ones_like(branch_input))
+
+    out_baseline = forward(baseline)
+    out_neutral = forward(neutral)
+    out_weighted = forward(weighted)
+
+    assert torch.equal(out_baseline, out_neutral), "p=1 forward is not bitwise identical"
+
+    out_baseline.sum().backward()
+    out_neutral.sum().backward()
+    for (name, p_base), (_, p_new) in zip(
+        baseline.named_parameters(), neutral.named_parameters()
+    ):
+        assert torch.equal(p_base.grad, p_new.grad), f"p=1 gradient differs for {name}"
+    print("  p=1 forward and gradients bitwise identical: PASS")
+
+    assert not torch.allclose(out_baseline, out_weighted), (
+        "p=1.3 produced the same output as ORTBP2N; the gain is not taking effect"
+    )
+    print("  p=1.3 changes the output: PASS")
+
+    # At init the chart logits are exactly zero, so every gain must agree there.
+    fresh_baseline = ORTBP2N_MHC(4, dim=32, layer_index=0)
+    fresh_weighted = DORTBP2N_MHC(4, dim=32, layer_index=0, depth_gain_base=1.3)
+    assert torch.equal(forward(fresh_baseline), forward(fresh_weighted)), (
+        "gains must not change the midpoint initialization"
+    )
+    print("  midpoint initialization unchanged by the gain: PASS")
+
+    return True
+
+
+def test_dortbp_double_stochasticity():
+    """The depth-weighted chart still produces exact DS matrices with finite gradients."""
+    from hyper_conn.dortbp2n_mhc import (
+        DORTBP2N_MHC,
+        DepthWeightedPowerOfTwoRecursiveTransportBirkhoff,
+    )
+
+    print("\nTesting DORTBP2N double stochasticity...")
+
+    for n in (2, 4, 8):
+        for base in (1.0, 1.3, 0.7):
+            chart = DepthWeightedPowerOfTwoRecursiveTransportBirkhoff(
+                n, depth_gain_base=base
+            )
+            params = torch.randn(3, n - 1, n - 1, requires_grad=True)
+            ds = chart(params)
+
+            row_sums = ds.sum(dim=-1)
+            col_sums = ds.sum(dim=-2)
+            ones = torch.ones_like(row_sums)
+            assert torch.allclose(row_sums, ones, atol=1e-5), f"n={n} p={base}: row sums not 1"
+            assert torch.allclose(col_sums, ones, atol=1e-5), f"n={n} p={base}: col sums not 1"
+            assert ds.min() >= -1e-6, f"n={n} p={base}: negative entries"
+
+            ds.sum().backward()
+            assert torch.isfinite(params.grad).all(), f"n={n} p={base}: non-finite grads"
+        print(f"  n={n}: exact DS and finite grads for p in (1.0, 1.3, 0.7): OK")
+
+    # Same check through the full layer, which also exercises the einsum plumbing.
+    for n in (2, 4, 8):
+        layer = _perturb_chart_params(
+            DORTBP2N_MHC(n, dim=32, layer_index=0, depth_gain_base=1.3)
+        )
+        x = torch.randn(4 * n, 6, 32)
+        _, normed = layer._prepare_inputs(x)
+        alpha, _ = layer._compute_alpha_beta(normed, x.device)
+        h_res = alpha[..., layer.num_input_views:]
+        row_sums = h_res.sum(dim=-1)
+        assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5), (
+            f"n={n}: layer H^res rows do not sum to 1"
+        )
+        print(f"  n={n}: layer H^res rows sum to 1: OK")
+
+    print("  DORTBP2N double stochasticity: PASS")
+    return True
+
+
+def test_dortbp_depth_support():
+    """
+    Depth labels track locality in the real chart.
+
+    The union of dX/dt supports across several random logit draws approximates each
+    coordinate's structural footprint. The largest footprint at depth d is bounded by
+    n^2 / 2^d: the root touches the whole matrix and every extra level halves the
+    reach. Single draws are not usable here because degenerate zero-width intervals
+    zero out individual gradients, and the union only converges to the bound as draws
+    accumulate, so the per-depth maximum is checked against the bound and for a strict
+    decrease with depth rather than for exact equality.
+    """
+    from hyper_conn.dortbp2n_mhc import chart_depth_labels
+    from hyper_conn.srtbp2n_mhc import scaled_recursive_transport_birkhoff_power2
+
+    print("\nTesting DORTBP2N depth-label locality...")
+
+    for n in (4, 8):
+        labels = chart_depth_labels(n)
+        num_params = (n - 1) * (n - 1)
+        support = [torch.zeros(n * n, dtype=torch.bool) for _ in range(num_params)]
+
+        for seed in range(8):
+            torch.manual_seed(seed)
+            # Small but nonzero: at exactly zero the symmetric construction hits
+            # ties in minimum/maximum whose subgradients are convention-dependent.
+            t = (0.4 * torch.randn(1, n - 1, n - 1)).double().requires_grad_(True)
+            jac = torch.autograd.functional.jacobian(
+                lambda z: scaled_recursive_transport_birkhoff_power2(z).reshape(-1), t
+            )
+            for k in range(num_params):
+                support[k] |= jac[:, 0, k // (n - 1), k % (n - 1)].abs() > 1e-9
+
+        by_depth = {}
+        for k, depth in enumerate(labels):
+            by_depth.setdefault(depth, []).append(int(support[k].sum()))
+
+        maxima = []
+        for depth, sizes in sorted(by_depth.items()):
+            bound = (n * n) // (2 ** depth)
+            assert max(sizes) <= bound, (
+                f"n={n} d={depth}: max footprint {max(sizes)} exceeds bound {bound}"
+            )
+            maxima.append(max(sizes))
+        assert all(a > b for a, b in zip(maxima, maxima[1:])), (
+            f"n={n}: per-depth max footprints {maxima} are not strictly decreasing"
+        )
+        assert by_depth[0] == [n * n], f"n={n}: root does not touch the whole matrix"
+        print(f"  n={n}: max footprint per depth {maxima} (bound n^2/2^d): OK")
+
+    print("  DORTBP2N depth-label locality: PASS")
+    return True
+
+
+def test_dortbp_optimizer_groups():
+    """DORTBP2N exposes the same ORTBP optimizer groups as ORTBP2N."""
+    _repo_root_on_path()
+    from model import GPT, GPTConfig
+
+    cfg = GPTConfig(
+        block_size=16,
+        vocab_size=64,
+        n_layer=2,
+        n_head=2,
+        n_embd=8,
+        hyper_conn_n=4,
+        hyper_conn_type="dortbp2n_mhc",
+        ortbp_depth_gain_base=1.3,
+        ortbp_log_stats=True,
+    )
+    model = GPT(cfg)
+    overrides = {
+        "ortbp_residual_chart": {"lr": 1e-4, "weight_decay": 0.0, "betas": (0.8, 0.95)},
+        "ortbp_residual_scale": {"lr": 3e-5, "weight_decay": 0.0, "betas": (0.8, 0.95)},
+        "ortbp_delta": {"lr": 2e-5, "weight_decay": 0.0, "betas": (0.8, 0.95)},
+    }
+    opt = model.configure_optimizers(
+        0.1, 1e-3, (0.9, 0.95), "cpu", module_param_group_overrides=overrides
+    )
+
+    param_to_group = {}
+    for group in opt.param_groups:
+        group_name = group.get("group_name")
+        for param in group["params"]:
+            for name, candidate in model.named_parameters():
+                if candidate is param:
+                    param_to_group[name] = group_name
+
+    chart_names = [
+        n for n in param_to_group
+        if "dynamic_res_alpha_fn" in n or "static_alpha_res" in n
+    ]
+    assert chart_names, "expected DORTBP chart params in model"
+    assert all(param_to_group[n] == "ortbp_residual_chart" for n in chart_names)
+    assert all(
+        param_to_group[n] == "ortbp_residual_scale"
+        for n in param_to_group if n.endswith("residual_scale")
+    )
+    assert all(
+        param_to_group[n] == "ortbp_delta"
+        for n in param_to_group if "delta_logit" in n
+    )
+
+    # The gain is a buffer, so it must not add trainable parameters.
+    gain_params = [n for n, _ in model.named_parameters() if "chart_gain" in n]
+    assert not gain_params, f"chart_gain must not be a parameter, found {gain_params}"
+    buffers = [n for n, _ in model.named_buffers() if "chart_gain" in n]
+    assert buffers, "expected chart_gain buffers"
+    # Non-persistent, so it stays out of the checkpoint and cannot override config.
+    assert not [k for k in model.state_dict() if "chart_gain" in k], (
+        "chart_gain must not appear in state_dict"
+    )
+
+    idx = torch.randint(0, 64, (2, 8))
+    logits, loss = model(idx, idx)
+    loss.backward()
+    saw_depth_stats = False
+    for module in model.modules():
+        if not hasattr(module, "get_stats"):
+            continue
+        stats = module.get_stats()
+        if stats and any(k.startswith("chart_abs_mean_d") for k in stats):
+            saw_depth_stats = True
+            break
+    assert saw_depth_stats, "expected per-depth DORTBP stats after forward"
+
+    print("  DORTBP optimizer groups and per-depth stats: PASS")
+    return True
+
+
 def test_api_compatibility():
     """Test that all variants work through the unified interface."""
     from hyper_conn import hyper_conn_init_func
     
-    variants = ['none', 'hc', 'mhc', 'mhc_lite', 'kromhc', 'tbp_mhc', 'rtbp_mhc', 'srtbp_mhc', 'rtbp2n_mhc', 'srtbp2n_mhc', 'ortbp2n_mhc', 'msrtbp2n_mhc', 'amsrtbp2n_mhc']
+    variants = ['none', 'hc', 'mhc', 'mhc_lite', 'kromhc', 'tbp_mhc', 'rtbp_mhc', 'srtbp_mhc', 'rtbp2n_mhc', 'srtbp2n_mhc', 'ortbp2n_mhc', 'dortbp2n_mhc', 'msrtbp2n_mhc', 'amsrtbp2n_mhc']
     results = {}
     
     print("Testing API compatibility...")
@@ -228,6 +545,7 @@ def test_inheritance_hierarchy():
     from hyper_conn.rtbp2n_HC import RTBP2N_MHC
     from hyper_conn.srtbp2n_mhc import SRTBP2N_MHC
     from hyper_conn.ortbp2n_mhc import ORTBP2N_MHC
+    from hyper_conn.dortbp2n_mhc import DORTBP2N_MHC
     from hyper_conn.msrtbp2n_mhc import MSRTBP2N_MHC
     from hyper_conn.amsrtbp2n_mhc import AMSRTBP2N_MHC
     from hyper_conn.Kromhc import KromHC
@@ -245,6 +563,7 @@ def test_inheritance_hierarchy():
     assert issubclass(RTBP2N_MHC, BaseHyperConnections)
     assert issubclass(SRTBP2N_MHC, BaseHyperConnections)
     assert issubclass(ORTBP2N_MHC, BaseHyperConnections)
+    assert issubclass(DORTBP2N_MHC, ORTBP2N_MHC)
     assert issubclass(MSRTBP2N_MHC, BaseHyperConnections)
     assert issubclass(AMSRTBP2N_MHC, BaseHyperConnections)
     assert issubclass(KromHC, BaseHyperConnections)
@@ -264,7 +583,7 @@ def test_forward_backward():
     
     print("\nTesting forward/backward passes...")
     
-    variants = ['hc', 'mhc', 'mhc_lite', 'kromhc', 'tbp_mhc', 'rtbp_mhc', 'srtbp_mhc', 'rtbp2n_mhc', 'srtbp2n_mhc', 'ortbp2n_mhc', 'msrtbp2n_mhc', 'amsrtbp2n_mhc']
+    variants = ['hc', 'mhc', 'mhc_lite', 'kromhc', 'tbp_mhc', 'rtbp_mhc', 'srtbp_mhc', 'rtbp2n_mhc', 'srtbp2n_mhc', 'ortbp2n_mhc', 'dortbp2n_mhc', 'msrtbp2n_mhc', 'amsrtbp2n_mhc']
     
     for variant in variants:
         init_hc, expand, reduce = hyper_conn_init_func(variant, 4)
@@ -289,11 +608,11 @@ def test_forward_backward():
 
 def test_functional_api():
     """Test the functional (no-branch) API."""
-    from hyper_conn import KromHC, MHCLite, TBP_MHC, RTBP_MHC, SRTBP_MHC, RTBP2N_MHC, SRTBP2N_MHC, ORTBP2N_MHC, MSRTBP2N_MHC, AMSRTBP2N_MHC
+    from hyper_conn import KromHC, MHCLite, TBP_MHC, RTBP_MHC, SRTBP_MHC, RTBP2N_MHC, SRTBP2N_MHC, ORTBP2N_MHC, DORTBP2N_MHC, MSRTBP2N_MHC, AMSRTBP2N_MHC
     
     print("\nTesting functional API (no branch)...")
     
-    classes = [KromHC, MHCLite, TBP_MHC, RTBP_MHC, SRTBP_MHC, RTBP2N_MHC, SRTBP2N_MHC, ORTBP2N_MHC, MSRTBP2N_MHC, AMSRTBP2N_MHC]
+    classes = [KromHC, MHCLite, TBP_MHC, RTBP_MHC, SRTBP_MHC, RTBP2N_MHC, SRTBP2N_MHC, ORTBP2N_MHC, DORTBP2N_MHC, MSRTBP2N_MHC, AMSRTBP2N_MHC]
     
     for cls in classes:
         layer = cls(4, dim=512)  # No branch
@@ -336,7 +655,7 @@ def test_decorate_branch():
 def test_double_stochasticity():
     """Test that exact DS variants produce doubly stochastic matrices."""
     torch.manual_seed(0)
-    from hyper_conn import KromHC, MHCLite, TBP_MHC, RTBP_MHC, SRTBP_MHC, RTBP2N_MHC, SRTBP2N_MHC, ORTBP2N_MHC, MSRTBP2N_MHC, AMSRTBP2N_MHC
+    from hyper_conn import KromHC, MHCLite, TBP_MHC, RTBP_MHC, SRTBP_MHC, RTBP2N_MHC, SRTBP2N_MHC, ORTBP2N_MHC, DORTBP2N_MHC, MSRTBP2N_MHC, AMSRTBP2N_MHC
     from hyper_conn.rtbpHC import recursive_transport_birkhoff
     from hyper_conn.srtbpHC import scaled_recursive_transport_birkhoff
     from hyper_conn.rtbp2n_HC import recursive_transport_birkhoff_power2
@@ -346,7 +665,7 @@ def test_double_stochasticity():
     print("\nTesting double stochasticity (exact DS variants)...")
     
     # These variants should produce EXACT DS matrices
-    exact_ds_classes = [KromHC, MHCLite, TBP_MHC, RTBP_MHC, SRTBP_MHC, RTBP2N_MHC, SRTBP2N_MHC, ORTBP2N_MHC, MSRTBP2N_MHC, AMSRTBP2N_MHC]
+    exact_ds_classes = [KromHC, MHCLite, TBP_MHC, RTBP_MHC, SRTBP_MHC, RTBP2N_MHC, SRTBP2N_MHC, ORTBP2N_MHC, DORTBP2N_MHC, MSRTBP2N_MHC, AMSRTBP2N_MHC]
     
     for cls in exact_ds_classes:
         layer = cls(4, dim=512)
@@ -534,6 +853,11 @@ def run_all_tests():
         ("ORTBP Optimizer No Overrides", test_ortbp_optimizer_no_overrides_two_groups),
         ("Non-ORTBP Optimizer Groups", test_non_ortbp_optimizer_no_ortbp_groups),
         ("ORTBP Log Stats Smoke", test_ortbp_log_stats_smoke),
+        ("DORTBP Depth Labels", test_dortbp_depth_labels),
+        ("DORTBP Parity With ORTBP", test_dortbp_parity_with_ortbp),
+        ("DORTBP Double Stochasticity", test_dortbp_double_stochasticity),
+        ("DORTBP Depth Support", test_dortbp_depth_support),
+        ("DORTBP Optimizer Groups", test_dortbp_optimizer_groups),
         ("Functional API", test_functional_api),
         ("Decorate Branch", test_decorate_branch),
         ("Double Stochasticity", test_double_stochasticity),

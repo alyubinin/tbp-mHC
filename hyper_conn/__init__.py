@@ -316,6 +316,22 @@ from .ortbp2n_mhc import (
 )
 
 # ============================================================================
+# DORTBP2N-mHC: DEPTH-WEIGHTED OPTIMIZED POWER-OF-2 RECURSIVE TRANSPORT BIRKHOFF
+# ============================================================================
+# Same chart and parameter layout as ORTBP2N, with a static per-coordinate gain
+# g_d = p^d (mean-normalized) that weights each local transport choice by its
+# recursion depth, biasing the chart toward localized rearrangements.
+
+from .dortbp2n_mhc import (
+    DORTBP2N_MHC,
+    DORTBP2NHC,
+    DepthWeightedPowerOfTwoRecursiveTransportBirkhoff,
+    build_chart_gain,
+    chart_depth_labels,
+    get_init_and_expand_reduce_stream_functions as dortbp2n_get_init_and_expand_reduce_stream_functions,
+)
+
+# ============================================================================
 # MSRTBP2N-mHC: MARGINED SCALED POWER-OF-2 RECURSIVE TRANSPORT BIRKHOFF
 # ============================================================================
 # Exact doubly stochastic via the power-of-2 recursive transport construction,
@@ -456,7 +472,7 @@ from .tests import run_all_tests
 # Flag to prevent repeated logging of configuration
 flag = False
 
-def hyper_conn_init_func(hyper_conn_type: str, hyper_conn_n: int, atbp_permutations=None, alsb_permutations=None, astbp_permutations=None, amstbp_permutations=None, altbp_permutations=None, lmamstbp_lambda_init=None, lmamstbp_mu_init=None, lmaltbp_lambda_init=None, lmaltbp_mu_init=None, ortbp_log_stats=False):
+def hyper_conn_init_func(hyper_conn_type: str, hyper_conn_n: int, atbp_permutations=None, alsb_permutations=None, astbp_permutations=None, amstbp_permutations=None, altbp_permutations=None, lmamstbp_lambda_init=None, lmamstbp_mu_init=None, lmaltbp_lambda_init=None, lmaltbp_mu_init=None, ortbp_log_stats=False, ortbp_depth_gain_base=1.0, ortbp_depth_gains=None):
     """
     Unified factory function for all hyper-connection variants.
     
@@ -478,6 +494,7 @@ def hyper_conn_init_func(hyper_conn_type: str, hyper_conn_n: int, atbp_permutati
             - "rtbp2n_mhc": RTBP2N-mHC (Power-of-2 recursive transport - exact DS)
             - "srtbp2n_mhc": SRTBP2N-mHC (Scaled power-of-2 recursive transport - exact DS)
             - "ortbp2n_mhc": ORTBP2N-mHC (Optimizer-friendly SRTBP2N with split residual chart params)
+            - "dortbp2n_mhc": DORTBP2N-mHC (ORTBP2N with depth-weighted transport chart)
             - "msrtbp2n_mhc": MSRTBP2N-mHC (Margined scaled power-of-2 recursive transport - exact DS)
             - "amsrtbp2n_mhc": AMSRTBP2N-mHC (Averaged margined scaled power-of-2 recursive transport)
             - "stbp_mhc": STBP-mHC (Scaled Transport Birkhoff - exact DS)
@@ -563,6 +580,15 @@ def hyper_conn_init_func(hyper_conn_type: str, hyper_conn_n: int, atbp_permutati
         return ortbp2n_get_init_and_expand_reduce_stream_functions(
             hyper_conn_n,
             log_stats=ortbp_log_stats,
+        )
+
+    elif hyper_conn_type in {"dortbp2n_mhc", "dortbp2n_hc"}:
+        # DORTBP2N-mHC (ORTBP2N with depth-weighted p^d gain on the transport chart)
+        return dortbp2n_get_init_and_expand_reduce_stream_functions(
+            hyper_conn_n,
+            log_stats=ortbp_log_stats,
+            depth_gain_base=ortbp_depth_gain_base,
+            depth_gains=ortbp_depth_gains,
         )
 
     elif hyper_conn_type in {"msrtbp2n_mhc", "msrtbp2n_hc", "msrtdp2n_mhc", "msrtdp2n_hc"}:

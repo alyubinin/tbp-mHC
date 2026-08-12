@@ -153,7 +153,9 @@ class GPTConfig:
     lmamstbp_mu_init: float | None = None  # For lmamstbp_mhc: init for μ (default 0.01)
     lmaltbp_lambda_init: float | None = None  # For lmaltbp_mhc: init for λ (default 0.05)
     lmaltbp_mu_init: float | None = None  # For lmaltbp_mhc: init for μ (default 0.01)
-    ortbp_log_stats: bool = False  # For ortbp2n_mhc: log residual-chart diagnostics
+    ortbp_log_stats: bool = False  # For ortbp2n_mhc/dortbp2n_mhc: log residual-chart diagnostics
+    ortbp_depth_gain_base: float = 1.0  # For dortbp2n_mhc: p in the depth gain g_d = p^d (1.0 = ORTBP2N)
+    ortbp_depth_gains: list = None  # For dortbp2n_mhc: explicit per-depth gains, overriding p^d
 
 class GPT(nn.Module):
 
@@ -176,6 +178,8 @@ class GPT(nn.Module):
             lmaltbp_lambda_init=getattr(config, 'lmaltbp_lambda_init', None),
             lmaltbp_mu_init=getattr(config, 'lmaltbp_mu_init', None),
             ortbp_log_stats=getattr(config, 'ortbp_log_stats', False),
+            ortbp_depth_gain_base=getattr(config, 'ortbp_depth_gain_base', 1.0),
+            ortbp_depth_gains=getattr(config, 'ortbp_depth_gains', None),
         )
         self.expand_stream = expand_stream
         self.reduce_stream = reduce_stream

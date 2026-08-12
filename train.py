@@ -41,7 +41,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # ----- hyper conn start -----
-hyper_conn_type = "none" # none, hc, mhc, mhc_lite, kromhc, tbp_mhc, atbp_mhc, stbp_mhc, mstbp_mhc, ltbp_mhc, altbp_mhc, lmaltbp_mhc, astbp_mhc, amstbp_mhc, lmamstbp_mhc, analysis
+hyper_conn_type = "none" # none, hc, mhc, mhc_lite, kromhc, tbp_mhc, atbp_mhc, stbp_mhc, mstbp_mhc, ltbp_mhc, altbp_mhc, lmaltbp_mhc, astbp_mhc, amstbp_mhc, lmamstbp_mhc, ortbp2n_mhc, dortbp2n_mhc, analysis
 hyper_conn_n = 1 # num_streams
 
 # ----- hyper conn end -----
@@ -85,6 +85,7 @@ beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # -----------------------------------------------------------------------------
 # ORTBP2N-mHC training knobs (Phase 5 — all overridable via config/*.py or --key=value)
+# These apply to every member of the ORTBP family (ortbp2n_mhc, dortbp2n_mhc).
 # -----------------------------------------------------------------------------
 # ortbp_use_custom_optimizer: if True, ORTBP params get dedicated AdamW param groups.
 # ortbp_lr_mult: uniform scale on all ORTBP group LRs (multiplies the per-subgroup mults below).
@@ -96,6 +97,11 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # ortbp_grad_clip: max norm for residual chart + residual_scale params.
 # ortbp_delta_grad_clip: max norm for delta_logit.
 # ortbp_log_stats: if True, ORTBP layers record diagnostics; train logs ortbp/* metrics (Phase 4).
+# ortbp_depth_gain_base: dortbp2n_mhc only. p in the depth gain g_d = p^d applied to each
+#   transport-chart coordinate, mean-normalized so effective beta is unchanged. p > 1 favours
+#   localized (deep) decisions, p < 1 favours coarse (shallow) ones, p = 1.0 reproduces ORTBP2N.
+#   An explicit per-depth list can be set instead via `ortbp_depth_gains = [g0, g1, ...]` in a
+#   config file (list-valued, so it is read via globals() rather than the --key=value path).
 # -----------------------------------------------------------------------------
 ortbp_use_custom_optimizer = False
 ortbp_lr_mult = 1.0
@@ -108,6 +114,7 @@ ortbp_use_custom_grad_clip = False
 ortbp_grad_clip = 0.3
 ortbp_delta_grad_clip = 0.05
 ortbp_log_stats = False
+ortbp_depth_gain_base = 1.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
@@ -124,6 +131,11 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
+# Variants sharing the ORTBP optimizer-group, gradient-clipping, and diagnostics
+# contract. Defined after `config_keys` so it stays out of the logged config.
+ORTBP_FAMILY_TYPES = {"ortbp2n_mhc", "ortbp2n_hc", "dortbp2n_mhc", "dortbp2n_hc"}
+is_ortbp_family = hyper_conn_type in ORTBP_FAMILY_TYPES
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -236,6 +248,29 @@ if os.path.exists(meta_path):
     meta_vocab_size = meta.get('vocab_size')
     train_tokens_per_byte = meta.get('train_tokens_per_byte')
     val_tokens_per_byte = meta.get('val_tokens_per_byte')
+    if train_tokens_per_byte is None or val_tokens_per_byte is None:
+        input_path = os.path.join(data_dir, 'input.txt')
+        train_bin_path = os.path.join(data_dir, 'train.bin')
+        val_bin_path = os.path.join(data_dir, 'val.bin')
+        if os.path.exists(input_path) and os.path.exists(train_bin_path) and os.path.exists(val_bin_path):
+            with open(input_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            split_idx = int(len(text) * 0.9)
+            train_text = text[:split_idx]
+            val_text = text[split_idx:]
+            train_token_count = os.path.getsize(train_bin_path) // np.dtype(np.uint16).itemsize
+            val_token_count = os.path.getsize(val_bin_path) // np.dtype(np.uint16).itemsize
+            train_byte_count = len(train_text.encode('utf-8'))
+            val_byte_count = len(val_text.encode('utf-8'))
+            if train_byte_count > 0:
+                train_tokens_per_byte = train_token_count / train_byte_count
+            if val_byte_count > 0:
+                val_tokens_per_byte = val_token_count / val_byte_count
+            if train_tokens_per_byte is not None or val_tokens_per_byte is not None:
+                print(
+                    "derived tokens_per_byte from input.txt: "
+                    f"train={train_tokens_per_byte}, val={val_tokens_per_byte}"
+                )
     if meta_vocab_size is not None:
         print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 vocab_size = meta_vocab_size
@@ -252,8 +287,11 @@ model_args = dict(
     hyper_conn_n=hyper_conn_n,
     hyper_conn_type=hyper_conn_type
 )
-if hyper_conn_type == "ortbp2n_mhc":
+if is_ortbp_family:
     model_args["ortbp_log_stats"] = globals().get("ortbp_log_stats", False)
+if hyper_conn_type in {"dortbp2n_mhc", "dortbp2n_hc"}:
+    model_args["ortbp_depth_gain_base"] = globals().get("ortbp_depth_gain_base", 1.0)
+    model_args["ortbp_depth_gains"] = globals().get("ortbp_depth_gains", None)
 if hyper_conn_type in {"atbp_mhc", "alsb_mhc"}:
     model_args["atbp_permutations"] = globals().get("atbp_permutations", globals().get("alsb_permutations", None))
 if hyper_conn_type == "astbp_mhc":
@@ -313,6 +351,18 @@ elif init_from == 'resume':
         model_args['lmaltbp_lambda_init'] = checkpoint_model_args['lmaltbp_lambda_init']
     if 'lmaltbp_mu_init' in checkpoint_model_args:
         model_args['lmaltbp_mu_init'] = checkpoint_model_args['lmaltbp_mu_init']
+    # The DORTBP depth gain reshapes the transport chart, so it has to match the
+    # checkpoint. Take the checkpoint value but say so when the config disagrees,
+    # since the gain buffer is derived from config and would otherwise change silently.
+    for k in ['ortbp_depth_gain_base', 'ortbp_depth_gains']:
+        if k not in checkpoint_model_args:
+            continue
+        if k in model_args and model_args[k] != checkpoint_model_args[k]:
+            print(
+                f"Warning: {k}={model_args[k]} from config differs from checkpoint "
+                f"value {checkpoint_model_args[k]}; using the checkpoint value"
+            )
+        model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -389,7 +439,7 @@ def get_optimizer_group_overrides():
     use separate learning-rate multipliers and betas while leaving the rest of
     the model on the default optimizer settings.
     """
-    if hyper_conn_type != "ortbp2n_mhc" or not ortbp_use_custom_optimizer:
+    if not is_ortbp_family or not ortbp_use_custom_optimizer:
         return None
 
     ortbp_betas = (ortbp_beta1, ortbp_beta2)
@@ -442,7 +492,7 @@ def collect_ortbp_stats(model):
     Each ORTBP layer stores only the latest detached scalar stats from its most
     recent forward pass, so aggregation here is cheap and logging-friendly.
     """
-    if hyper_conn_type != "ortbp2n_mhc" or not ortbp_log_stats:
+    if not is_ortbp_family or not ortbp_log_stats:
         return {}
 
     stats_by_name = {}
@@ -479,7 +529,7 @@ def clip_gradients(optimizer, model):
     }
 
     use_custom_ortbp_clip = (
-        hyper_conn_type == "ortbp2n_mhc"
+        is_ortbp_family
         and ortbp_use_custom_optimizer
         and ortbp_use_custom_grad_clip
     )
@@ -685,12 +735,12 @@ while True:
     ortbp_grad_norm = -1.
     ortbp_delta_norm = -1.
     should_unscale = grad_clip > 0. or (
-        hyper_conn_type == "ortbp2n_mhc"
+        is_ortbp_family
         and ortbp_use_custom_optimizer
         and ortbp_use_custom_grad_clip
     )
     should_clip = grad_clip > 0. or (
-        hyper_conn_type == "ortbp2n_mhc"
+        is_ortbp_family
         and ortbp_use_custom_optimizer
         and ortbp_use_custom_grad_clip
     )

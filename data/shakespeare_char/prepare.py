@@ -52,10 +52,18 @@ train_ids.tofile(os.path.join(os.path.dirname(__file__), 'train.bin'))
 val_ids.tofile(os.path.join(os.path.dirname(__file__), 'val.bin'))
 
 # save the meta information as well, to help us encode/decode later
+train_byte_count = len(train_data.encode('utf-8'))
+val_byte_count = len(val_data.encode('utf-8'))
 meta = {
     'vocab_size': vocab_size,
     'itos': itos,
     'stoi': stoi,
+    'train_total_tokens': len(train_ids),
+    'train_total_bytes': train_byte_count,
+    'train_tokens_per_byte': len(train_ids) / train_byte_count,
+    'val_total_tokens': len(val_ids),
+    'val_total_bytes': val_byte_count,
+    'val_tokens_per_byte': len(val_ids) / val_byte_count,
 }
 with open(os.path.join(os.path.dirname(__file__), 'meta.pkl'), 'wb') as f:
     pickle.dump(meta, f)
